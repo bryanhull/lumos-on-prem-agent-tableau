@@ -1,0 +1,230 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Deploy the Lumos On-Premise Agent on Amazon ECS Fargate (x86_64),
+  with API key in Secrets Manager and logs to CloudWatch.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC where the ECS tasks will run.
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Subnets for the ECS service (public with AssignPublicIp=ENABLED, or private with NAT).
+  AssignPublicIp:
+    Type: String
+    AllowedValues: [ENABLED, DISABLED]
+    Default: DISABLED
+    Description: ENABLED if you place tasks in public subnets; DISABLED for private subnets (must have NAT).
+  DesiredCount:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    Description: Number of Lumos Agent tasks to run (set to 2+ for HA).
+  Cpu:
+    Type: String
+    Default: "2048"
+    AllowedValues: ["256", "512", "1024", "2048", "4096"]
+    Description: Task CPU (Fargate). "2048" (~2 vCPU) recommended by default.
+  Memory:
+    Type: String
+    Default: "16384"
+    Description: Task memory (MiB). "16384" (16 GiB) aligns with doc guidance.
+  EphemeralStorageGiB:
+    Type: Number
+    Default: 64
+    MinValue: 21
+    MaxValue: 200
+    Description: Fargate ephemeral storage (GiB) for /onprem/agent files/logs.
+  LogRetentionInDays:
+    Type: Number
+    Default: 30
+    Description: CloudWatch Logs retention in days.
+  ContainerImageRepo:
+    Type: String
+    Default: public.ecr.aws/g3l5j2q0/lumos/on-premise-agent
+    Description: Container image repository (public ECR).
+  ImageTag:
+    Type: String
+    Default: latest
+    Description: Image tag (pin to a version to avoid surprise updates).
+  ExistingSecretArn:
+    Type: String
+    Default: ''
+    Description: ARN of an existing Secrets Manager secret containing the API key (key is the whole secret value).
+  LumosApiKey:
+    Type: String
+    NoEcho: true
+    Default: ''
+    Description: If not using ExistingSecretArn, provide the API key here and the stack will create a secret.
+  LUMOS_ON_PREMISE_AGENT_LOG_LEVEL:
+    Type: String
+    Default: ''
+    Description: Optional log level (e.g., DEBUG, INFO, WARNING, ERROR).
+  LUMOS_LOG_TO_STDOUT:
+    Type: String
+    AllowedValues: [true, false]
+    Default: true
+    Description: Send agent/connector logs to stdout for CloudWatch collection.
+  LUMOS_ON_PREMISE_AGENT_SEND_CRITICAL_LOGS_TO_LUMOS:
+    Type: String
+    AllowedValues: [true, false]
+    Default: false
+    Description: Forward only critical (Error+) logs back to Lumos.
+  ProxyUrl:
+    Type: String
+    Default: ''
+    Description: Optional http(s) proxy base URL (e.g., http://proxy:8080). Sets HTTP_PROXY/HTTPS_PROXY.
+
+Conditions:
+  CreateSecret: !Equals [!Ref ExistingSecretArn, '']
+  UseProxy: !Not [!Equals [!Ref ProxyUrl, '']]
+  HasLogLevel: !Not [!Equals [!Ref LUMOS_ON_PREMISE_AGENT_LOG_LEVEL, '']]
+
+Resources:
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/lumos-onprem-agent/${AWS::StackName}
+      RetentionInDays: !Ref LogRetentionInDays
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub lumos-agent-exec-${AWS::StackName}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub lumos-agent-task-${AWS::StackName}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+
+  LumosApiKeySecret:
+    Condition: CreateSecret
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub lumos/onprem-agent/api-key/${AWS::StackName}
+      Description: Lumos On-Prem Agent API key
+      SecretString: !Ref LumosApiKey
+
+  ServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Egress to Internet/internal for Lumos Agent and connectors
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub lumos-onprem-agent-${AWS::StackName}
+      Configuration:
+        ExecuteCommandConfiguration:
+          Logging: DEFAULT
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: lumos-onprem-agent
+      Cpu: !Ref Cpu
+      Memory: !Ref Memory
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      RuntimePlatform:
+        OperatingSystemFamily: LINUX
+        CpuArchitecture: X86_64
+      EphemeralStorage:
+        SizeInGiB: !Ref EphemeralStorageGiB
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: lumos-onprem-agent
+          Image: !Sub ${ContainerImageRepo}:${ImageTag}
+          Essential: true
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: lumos-agent
+          Secrets:
+            - Name: LUMOS_ON_PREMISE_AGENT_API_KEY
+              ValueFrom: !If
+                - CreateSecret
+                - !GetAtt LumosApiKeySecret.Arn
+                - !Ref ExistingSecretArn
+          Environment: !If
+            - UseProxy
+            - - Name: LUMOS_LOG_TO_STDOUT
+                Value: !Ref LUMOS_LOG_TO_STDOUT
+              - Name: LUMOS_ON_PREMISE_AGENT_SEND_CRITICAL_LOGS_TO_LUMOS
+                Value: !Ref LUMOS_ON_PREMISE_AGENT_SEND_CRITICAL_LOGS_TO_LUMOS
+              - !If
+                - HasLogLevel
+                - { Name: LUMOS_ON_PREMISE_AGENT_LOG_LEVEL, Value: !Ref LUMOS_ON_PREMISE_AGENT_LOG_LEVEL }
+                - { Ref: AWS::NoValue }
+              - Name: HTTP_PROXY
+                Value: !Ref ProxyUrl
+              - Name: HTTPS_PROXY
+                Value: !Ref ProxyUrl
+            - - Name: LUMOS_LOG_TO_STDOUT
+                Value: !Ref LUMOS_LOG_TO_STDOUT
+              - Name: LUMOS_ON_PREMISE_AGENT_SEND_CRITICAL_LOGS_TO_LUMOS
+                Value: !Ref LUMOS_ON_PREMISE_AGENT_SEND_CRITICAL_LOGS_TO_LUMOS
+              - !If
+                - HasLogLevel
+                - { Name: LUMOS_ON_PREMISE_AGENT_LOG_LEVEL, Value: !Ref LUMOS_ON_PREMISE_AGENT_LOG_LEVEL }
+                - { Ref: AWS::NoValue }
+
+  EcsService:
+    Type: AWS::ECS::Service
+    DependsOn: LogGroup
+    Properties:
+      ServiceName: !Sub lumos-onprem-agent-${AWS::StackName}
+      Cluster: !Ref EcsCluster
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      DesiredCount: !Ref DesiredCount
+      EnableECSManagedTags: true
+      PropagateTags: TASK_DEFINITION
+      TaskDefinition: !Ref TaskDefinition
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: !Ref AssignPublicIp
+          Subnets: !Ref SubnetIds
+          SecurityGroups:
+            - !Ref ServiceSecurityGroup
+
+Outputs:
+  ClusterName:
+    Description: ECS cluster name
+    Value: !Ref EcsCluster
+  ServiceName:
+    Description: ECS service name
+    Value: !Ref EcsService
+  TaskDefinitionArn:
+    Description: Task Definition ARN
+    Value: !Ref TaskDefinition
+  LogGroupName:
+    Description: CloudWatch Logs log group
+    Value: !Ref LogGroup
+  ApiKeySecretArnInUse:
+    Description: Secrets Manager ARN used for LUMOS_ON_PREMISE_AGENT_API_KEY
+    Value: !If
+      - CreateSecret
+      - !GetAtt LumosApiKeySecret.Arn
+      - !Ref ExistingSecretArn
